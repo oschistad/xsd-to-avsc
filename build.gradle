@@ -1,0 +1,28 @@
+apply plugin: 'java-library'
+apply plugin: 'maven'
+apply plugin: 'scala'
+
+group = 'no.ssb'
+version = '0.0.1-SNAPSHOT'
+
+description = "Convert XML Schema definitions (xsd) into avro schemas (avsc)"
+
+sourceCompatibility = 1.8
+targetCompatibility = 1.8
+
+repositories {
+    maven { url "http://repo.maven.apache.org/maven2" }
+}
+
+dependencies {
+    implementation 'org.scala-lang:scala-library:2.12.1'
+    implementation 'org.scala-lang:scala-reflect:2.12.1'
+    implementation 'xerces:xercesImpl:2.11.0'
+    implementation 'commons-io:commons-io:2.6'
+
+    api 'org.apache.avro:avro:1.7.7'
+
+    testImplementation 'junit:junit:4.8.1'
+    testImplementation 'org.scalatest:scalatest_2.12:3.0.8'
+    testImplementation 'org.assertj:assertj-core:3.11.1'
+}
