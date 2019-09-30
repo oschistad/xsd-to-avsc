@@ -1,6 +1,6 @@
 package no.ssb.xsdtoavsc
 
-import java.io.{IOException, InputStream}
+import java.io.InputStream
 
 import javax.xml.XMLConstants
 import no.ssb.xsdtoavsc.config.{Config, DecimalConfig, LogicalTypesConfig}
@@ -9,8 +9,6 @@ import org.apache.avro.Schema.Field
 import org.apache.xerces.dom.DOMInputImpl
 import org.apache.xerces.impl.Constants
 import org.apache.xerces.impl.xs.{SchemaGrammar, XMLSchemaLoader, XSComplexTypeDecl}
-import org.apache.xerces.xni.parser.{XMLEntityResolver, XMLInputSource}
-import org.apache.xerces.xni.{XMLResourceIdentifier, XNIException}
 import org.apache.xerces.xs.XSConstants.{ATTRIBUTE_DECLARATION, ELEMENT_DECLARATION, MODEL_GROUP, WILDCARD}
 import org.apache.xerces.xs.XSTypeDefinition.{COMPLEX_TYPE, SIMPLE_TYPE}
 import org.apache.xerces.xs._
@@ -20,11 +18,9 @@ import org.codehaus.jackson.node.{IntNode, NullNode}
 import scala.collection.JavaConverters._
 import scala.collection.immutable.HashMap
 import scala.collection.mutable
-import scala.reflect.io.Path
 
 final class XsdToAvscConverter(config: Config) {
   XNode.namespaces = config.namespaces
-  private val baseDir = config.baseDir
   private val stringTimestamp = config.stringTimestamp
   private val rebuildChoice = config.rebuildChoice
   private val ignoreHiveKeywords = config.ignoreHiveKeywords
@@ -37,40 +33,44 @@ final class XsdToAvscConverter(config: Config) {
   private var typeCount = -1
   private var typeLevel = 0
 
-  if (stringTimestamp)
+  if (stringTimestamp) {
     XsdToAvscConverter.PRIMITIVES += XSConstants.DATETIME_DT -> Schema.Type.STRING
+  }
 
   def convert(xsd: InputStream): Schema = {
     val errorHandler = new ErrorHandler
+
     val model = {
       val schemaInput = new DOMInputImpl()
       schemaInput.setByteStream(xsd)
+
       val loader = new XMLSchemaLoader
-      if (baseDir.isDefined)
-        loader.setEntityResolver(new SchemaResolver(baseDir.get))
       loader.setErrorHandler(errorHandler)
       loader.setParameter(Constants.DOM_ERROR_HANDLER, errorHandler)
-      loader load schemaInput
+      loader.load(schemaInput)
     }
 
-    errorHandler check()
+    errorHandler.check()
 
     // Generate schema for all the elements
     val schema = {
       val tempSchemas = mutable.LinkedHashMap[XSObject, Schema]()
-      val elements: XSNamedMap =
-        model.getComponents(XSConstants.ELEMENT_DECLARATION)
-      val rootElements =
+      val elements: XSNamedMap = model.getComponents(XSConstants.ELEMENT_DECLARATION)
+
+      val rootElements = {
         if (rootElementQName.isDefined) {
           val rootElement = Option(elements.itemByName(rootElementQName.get.getNamespaceURI match {
             case XMLConstants.NULL_NS_URI => null;
             case ns: String => ns
           }, rootElementQName.get.getLocalPart))
-          if (rootElement.isEmpty)
+          if (rootElement.isEmpty) {
             throw new NoSuchElementException(s"The schema contains no root level element definition for QName '${rootElementQName.get}'")
+          }
           HashMap("1" -> rootElement.get)
+        } else {
+          elements.asScala
         }
-        else elements.asScala
+      }
 
       for ((_, ele: XSElementDeclaration) <- rootElements) {
         tempSchemas += ele -> processType(ele.getTypeDefinition,
@@ -78,19 +78,19 @@ final class XsdToAvscConverter(config: Config) {
           array = false)
       }
 
-      if (tempSchemas.isEmpty)
+      if (tempSchemas.isEmpty) {
         throw ConversionException("No root element declaration found")
+      }
 
       // Create root record from the schemas generated
-      if (tempSchemas.size == 1) tempSchemas.valuesIterator.next()
-      else {
+      if (tempSchemas.size == 1) {
+        tempSchemas.valuesIterator.next()
+      } else {
         val nullSchema = Schema.create(Schema.Type.NULL)
         val fields = mutable.ListBuffer[Field]()
         for ((ele, record) <- tempSchemas) {
-          val optionalSchema = Schema createUnion List[Schema](nullSchema,
-            record).asJava
-          val field =
-            new Field(validName(ele.getName).get, optionalSchema, null, null)
+          val optionalSchema = Schema createUnion List[Schema](nullSchema, record).asJava
+          val field = new Field(validName(ele.getName).get, optionalSchema, null, null)
           field.addProp(XNode.SOURCE, XNode(ele).source)
           fields += field
         }
@@ -100,13 +100,10 @@ final class XsdToAvscConverter(config: Config) {
         record
       }
     }
-
     schema
   }
 
-  private def processType(eleType: XSTypeDefinition,
-                          optional: Boolean,
-                          array: Boolean): Schema = {
+  private def processType(eleType: XSTypeDefinition, optional: Boolean, array: Boolean): Schema = {
     typeLevel += 1
     var schema = eleType.getTypeCategory match {
       case SIMPLE_TYPE => primaryType(eleType)
@@ -117,8 +114,9 @@ final class XsdToAvscConverter(config: Config) {
       case others =>
         throw ConversionException(s"Unknown Element type: $others")
     }
-    if (array)
+    if (array) {
       schema = Schema createArray schema
+    }
     if (optional) {
       val nullSchema = Schema create Schema.Type.NULL
       schema = Schema createUnion List[Schema](nullSchema, schema).asJava
@@ -127,23 +125,20 @@ final class XsdToAvscConverter(config: Config) {
     schema
   }
 
-  private def processGroup(
-                            term: XSTerm,
-                            innerOptional: Boolean = false,
-                            array: Boolean = false): mutable.Map[String, Field] = {
+  private def processGroup(term: XSTerm, innerOptional: Boolean = false, array: Boolean = false): mutable.Map[String, Field] = {
     val fields = mutable.LinkedHashMap[String, Field]()
     val group = term.asInstanceOf[XSModelGroup]
     group.getCompositor match {
       case XSModelGroup.COMPOSITOR_CHOICE =>
-        if (rebuildChoice)
+        if (rebuildChoice) {
           fields ++= processGroupParticle(group,
             innerOptional = true,
             innerArray = array)
-        else if (!array)
+        } else if (!array) {
           fields ++= processGroupParticle(group,
             innerOptional = true,
             innerArray = false)
-        else {
+        } else {
           val name = generateTypeName
           val groupRecord = createRecord(generateTypeName, group)
           fields += (name -> new Field(name,
@@ -152,11 +147,11 @@ final class XsdToAvscConverter(config: Config) {
             null))
         }
       case XSModelGroup.COMPOSITOR_SEQUENCE | XSModelGroup.COMPOSITOR_ALL =>
-        if (!array)
+        if (!array) {
           fields ++= processGroupParticle(group,
             innerOptional,
             innerArray = false)
-        else {
+        } else {
           val name = generateTypeName
           val groupRecord = createRecord(generateTypeName, group)
           fields += (name -> new Field(name,
@@ -164,17 +159,12 @@ final class XsdToAvscConverter(config: Config) {
             null,
             null))
         }
-
     }
   }
 
-  private def processGroupParticle(
-                                    group: XSModelGroup,
-                                    innerOptional: Boolean,
-                                    innerArray: Boolean): mutable.Map[String, Field] = {
+  private def processGroupParticle(group: XSModelGroup, innerOptional: Boolean, innerArray: Boolean): mutable.Map[String, Field] = {
     val fields = mutable.LinkedHashMap[String, Field]()
-    for (particle <- group.getParticles.asScala.map(
-      _.asInstanceOf[XSParticle])) {
+    for (particle <- group.getParticles.asScala.map(_.asInstanceOf[XSParticle])) {
       val optional = innerOptional || particle.getMinOccurs == 0
       val array = innerArray || particle.getMaxOccurs > 1 || particle.getMaxOccursUnbounded
       val innerTerm = particle.getTerm
@@ -191,8 +181,7 @@ final class XsdToAvscConverter(config: Config) {
     fields
   }
 
-  private def processAttributes(
-                                 complexType: XSComplexTypeDefinition): mutable.Map[String, Field] = {
+  private def processAttributes(complexType: XSComplexTypeDefinition): mutable.Map[String, Field] = {
     val fields = mutable.LinkedHashMap[String, Field]()
 
     // Process normal attributes
@@ -212,16 +201,14 @@ final class XsdToAvscConverter(config: Config) {
     fields
   }
 
-  private def processExtension(
-                                complexType: XSComplexTypeDefinition): mutable.Map[String, Field] = {
+  private def processExtension(complexType: XSComplexTypeDefinition): mutable.Map[String, Field] = {
     val fields = mutable.LinkedHashMap[String, Field]()
 
     if (complexType derivedFromType(SchemaGrammar.fAnySimpleType, XSConstants.DERIVATION_EXTENSION)) {
       var extnType = complexType
       while (extnType.getBaseType.getTypeCategory == XSTypeDefinition.COMPLEX_TYPE) extnType =
         extnType.getBaseType.asInstanceOf[XSComplexTypeDefinition]
-      val fieldSchema =
-        processType(extnType.getBaseType, optional = true, array = false)
+      val fieldSchema = processType(extnType.getBaseType, optional = true, array = false)
       val field = new Field(XNode.TEXT_VALUE, fieldSchema, null, null)
       field.addProp(XNode.SOURCE, XNode.textNode.source)
       fields += (field.name() -> field)
@@ -229,9 +216,9 @@ final class XsdToAvscConverter(config: Config) {
     fields
   }
 
-  private def processParticle(
-                               complexType: XSComplexTypeDefinition): mutable.Map[String, Field] = {
+  private def processParticle(complexType: XSComplexTypeDefinition): mutable.Map[String, Field] = {
     val fields = mutable.LinkedHashMap[String, Field]()
+
     val particle = Option(complexType.getParticle)
     if (particle.isDefined) {
       val optional = particle.get.getMinOccurs == 0
@@ -258,8 +245,7 @@ final class XsdToAvscConverter(config: Config) {
   }
 
   // Checks if the new set of fields are already existing and generates a new name for duplicate fields
-  private def updateFields(originalFields: mutable.Map[String, Field],
-                           newField: mutable.Map[String, Field]): Unit = {
+  private def updateFields(originalFields: mutable.Map[String, Field], newField: mutable.Map[String, Field]): Unit = {
     //TODO make it unique
     for ((key, field) <- newField) {
       if (key != "others" && (originalFields contains key)) {
@@ -276,9 +262,7 @@ final class XsdToAvscConverter(config: Config) {
   }
 
   // Create field for an element
-  private def createField(ele: XSObject,
-                          optional: Boolean,
-                          array: Boolean = false): Schema.Field = {
+  private def createField(ele: XSObject, optional: Boolean, array: Boolean = false): Schema.Field = {
     val field: Field = ele.getType match {
       case ELEMENT_DECLARATION | ATTRIBUTE_DECLARATION =>
         val (eleType, attribute) = ele.getType match {
@@ -288,25 +272,26 @@ final class XsdToAvscConverter(config: Config) {
             (ele.asInstanceOf[XSAttributeDeclaration].getTypeDefinition, true)
         }
 
-        val fieldName =
-          if (attribute)
+        val fieldName = {
+          if (attribute) {
             validName(config.attributePrefix + ele.getName).get
-          else
+          } else {
             validName(ele.getName).get
+          }
+        }
 
         val fieldSchema: Schema = processType(eleType, optional, array)
         val defaultValue: JsonNode = if (optional) NullNode.getInstance() else null
 
-        val field: Field =
-          new Field(fieldName, fieldSchema, null, defaultValue)
+        val field: Field = new Field(fieldName, fieldSchema, null, defaultValue)
 
         field.addProp(XNode.SOURCE, XNode(ele, attribute).source)
 
         if (eleType.getTypeCategory == SIMPLE_TYPE) {
-          val tempType =
-            eleType.asInstanceOf[XSSimpleTypeDefinition].getBuiltInKind
-          if (tempType == XSConstants.DATETIME_DT && xsDateTimeMapping == LogicalTypesConfig.LONG)
+          val tempType = eleType.asInstanceOf[XSSimpleTypeDefinition].getBuiltInKind
+          if (tempType == XSConstants.DATETIME_DT && xsDateTimeMapping == LogicalTypesConfig.LONG) {
             field.addProp("comment", "timestamp")
+          }
         }
         field
       case WILDCARD =>
@@ -322,14 +307,17 @@ final class XsdToAvscConverter(config: Config) {
   private def createRecord(name: String, eleType: XSObject): Schema = {
     val schema = Schema.createRecord(name, null, null, false)
     schemas += (name -> schema)
-    schema setFields createFields(eleType).asJava
+    schema.setFields(createFields(eleType).asJava)
     schema
   }
 
   private def complexTypeName(eleType: XSTypeDefinition): String = {
     val name = validName(eleType.asInstanceOf[XSComplexTypeDecl].getTypeName)
-    if (name.isDefined) name.get
-    else generateTypeName
+    if (name.isDefined) {
+      name.get
+    } else {
+      generateTypeName
+    }
   }
 
   private def generateTypeName: String = {
@@ -382,8 +370,7 @@ final class XsdToAvscConverter(config: Config) {
 
   private def primaryType(schemaType: XSTypeDefinition): Schema = {
 
-    val simpleType = schemaType
-      .asInstanceOf[XSSimpleTypeDefinition]
+    val simpleType = schemaType.asInstanceOf[XSSimpleTypeDefinition]
 
     val schema = simpleType.getBuiltInKind match {
       // Mapping xs:dateTime to logical types
@@ -426,14 +413,11 @@ final class XsdToAvscConverter(config: Config) {
   }
 
   private def mapDecimal(simpleType: XSSimpleTypeDefinition): Schema = {
-    val totalDigitsFacet = Option(simpleType.getFacet(XSSimpleTypeDefinition.FACET_TOTALDIGITS)
-      .asInstanceOf[XSFacet])
+    val totalDigitsFacet = Option(simpleType.getFacet(XSSimpleTypeDefinition.FACET_TOTALDIGITS).asInstanceOf[XSFacet])
 
-    val factionDigitsFacet = Option(simpleType.getFacet(XSSimpleTypeDefinition.FACET_FRACTIONDIGITS)
-      .asInstanceOf[XSFacet])
+    val factionDigitsFacet = Option(simpleType.getFacet(XSSimpleTypeDefinition.FACET_FRACTIONDIGITS).asInstanceOf[XSFacet])
 
-    val avroTypeMapping = if (xsDecimalMapping.avroType != DecimalConfig.DECIMAL ||
-      totalDigitsFacet.isDefined && factionDigitsFacet.isDefined) {
+    val avroTypeMapping = if (xsDecimalMapping.avroType != DecimalConfig.DECIMAL || totalDigitsFacet.isDefined && factionDigitsFacet.isDefined) {
       xsDecimalMapping.avroType
     } else {
       xsDecimalMapping.fallbackType
@@ -441,15 +425,13 @@ final class XsdToAvscConverter(config: Config) {
 
     avroTypeMapping match {
       // xs:decimal to Avro double mapping or fallback to Avro double
-      case DecimalConfig.DOUBLE => {
+      case DecimalConfig.DOUBLE =>
         Schema.create(Schema.Type.DOUBLE)
-      }
       // xs:decimal to Avro string mapping or fallback to Avro string
-      case DecimalConfig.STRING => {
+      case DecimalConfig.STRING =>
         Schema.create(Schema.Type.STRING)
-      }
       // xs:decimal to Avro decimal
-      case DecimalConfig.DECIMAL => {
+      case DecimalConfig.DECIMAL =>
 
         val precision = if (totalDigitsFacet.isDefined) {
           totalDigitsFacet.get.getIntFacetValue
@@ -467,29 +449,10 @@ final class XsdToAvscConverter(config: Config) {
         decimalSchema.addProp("precision", IntNode.valueOf(precision))
         decimalSchema.addProp("scale", IntNode.valueOf(scale))
         decimalSchema
-      }
       case _ => throw new IllegalArgumentException("Illegal Avro type mapping for xs:decimal type declaration.")
     }
 
   }
-
-  /** Read the referenced XSD as per name specified */
-  private class SchemaResolver(private val baseDir: Path)
-    extends XMLEntityResolver {
-    System.setProperty("user.dir", baseDir.toAbsolute.path)
-
-    @throws[XNIException]
-    @throws[IOException]
-    def resolveEntity(id: XMLResourceIdentifier): XMLInputSource = {
-      val fileName = id.getLiteralSystemId
-      val path = Path(fileName).toAbsoluteWithRoot(baseDir)
-      val source = new XMLInputSource(id)
-      if (path.exists)
-        source.setByteStream(path.toFile.bufferedInput())
-      source
-    }
-  }
-
 }
 
 object XsdToAvscConverter {
