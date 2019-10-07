@@ -3,6 +3,7 @@ package no.ssb.xsdtoavsc
 import java.io.InputStream
 
 import javax.xml.XMLConstants
+import javax.xml.namespace.QName
 import no.ssb.xsdtoavsc.config.{Config, DecimalConfig, LogicalTypesConfig}
 import org.apache.avro.Schema
 import org.apache.avro.Schema.Field
@@ -18,8 +19,10 @@ import org.codehaus.jackson.node.{IntNode, NullNode}
 import scala.collection.JavaConverters._
 import scala.collection.immutable.HashMap
 import scala.collection.mutable
+import scala.collection.mutable.ListBuffer
 
 final class XsdToAvscConverter(config: Config) {
+
   XNode.namespaces = config.namespaces
   private val stringTimestamp = config.stringTimestamp
   private val rebuildChoice = config.rebuildChoice
@@ -37,45 +40,59 @@ final class XsdToAvscConverter(config: Config) {
     XsdToAvscConverter.PRIMITIVES += XSConstants.DATETIME_DT -> Schema.Type.STRING
   }
 
-  def convert(xsd: InputStream): Schema = {
-    val errorHandler = new ErrorHandler
+  def loadXSD(xsd: InputStream, errorHandler: ErrorHandler): XSModel = {
+    val schemaInput = new DOMInputImpl()
+    schemaInput.setByteStream(xsd)
 
-    val model = {
-      val schemaInput = new DOMInputImpl()
-      schemaInput.setByteStream(xsd)
+    val loader = new XMLSchemaLoader
+    loader.setErrorHandler(errorHandler)
+    loader.setParameter(Constants.DOM_ERROR_HANDLER, errorHandler)
+    loader.load(schemaInput)
+  }
 
-      val loader = new XMLSchemaLoader
-      loader.setErrorHandler(errorHandler)
-      loader.setParameter(Constants.DOM_ERROR_HANDLER, errorHandler)
-      loader.load(schemaInput)
+  private def getNamespace(qName: QName): String = {
+    qName.getNamespaceURI match {
+      case XMLConstants.NULL_NS_URI =>
+        null;
+      case ns: String =>
+        ns
     }
+  }
+
+  def getRootElements(root: QName, elements: XSNamedMap): HashMap[String, XSObject] = {
+      val rootElement: Option[XSObject] = Option(elements.itemByName(getNamespace(root), root.getLocalPart))
+
+      if (rootElement.isEmpty) {
+        throw new NoSuchElementException(s"The schema contains no root level element definition for QName '${rootElementQName.get}'")
+      }
+      HashMap("1" -> rootElement.get)
+  }
+
+  def convert(xsd: InputStream): Schema = {
+    val errorHandler: ErrorHandler = new ErrorHandler
+
+    val model: XSModel = loadXSD(xsd, errorHandler)
 
     errorHandler.check()
 
     // Generate schema for all the elements
-    val schema = {
-      val tempSchemas = mutable.LinkedHashMap[XSObject, Schema]()
-      val elements: XSNamedMap = model.getComponents(XSConstants.ELEMENT_DECLARATION)
+    val schema: Schema = {
 
-      val rootElements = {
-        if (rootElementQName.isDefined) {
-          val rootElement = Option(elements.itemByName(rootElementQName.get.getNamespaceURI match {
-            case XMLConstants.NULL_NS_URI => null;
-            case ns: String => ns
-          }, rootElementQName.get.getLocalPart))
-          if (rootElement.isEmpty) {
-            throw new NoSuchElementException(s"The schema contains no root level element definition for QName '${rootElementQName.get}'")
-          }
-          HashMap("1" -> rootElement.get)
-        } else {
-          elements.asScala
-        }
+      val elements: XSNamedMap = model.getComponents(XSConstants.ELEMENT_DECLARATION) //Get all top-level elements
+
+      var rootElements = Map[String, XSObject]()
+
+      //If root is configured to something else
+      if (rootElementQName.isDefined) {
+        rootElements = getRootElements(rootElementQName.get, elements)
+      } else {
+        rootElements = elements.asScala.toMap.asInstanceOf[Map[String, XSObject]]
       }
 
-      for ((_, ele: XSElementDeclaration) <- rootElements) {
-        tempSchemas += ele -> processType(ele.getTypeDefinition,
-          optional = false,
-          array = false)
+      val tempSchemas: mutable.LinkedHashMap[XSObject, Schema] = mutable.LinkedHashMap[XSObject, Schema]()
+
+      for ((_, elementDeclaration: XSElementDeclaration) <- rootElements) {
+        tempSchemas += elementDeclaration -> processType(elementDeclaration.getTypeDefinition, optional = false, array = false)
       }
 
       if (tempSchemas.isEmpty) {
@@ -86,14 +103,16 @@ final class XsdToAvscConverter(config: Config) {
       if (tempSchemas.size == 1) {
         tempSchemas.valuesIterator.next()
       } else {
-        val nullSchema = Schema.create(Schema.Type.NULL)
-        val fields = mutable.ListBuffer[Field]()
+        val nullSchema: Schema = Schema.create(Schema.Type.NULL)
+        val fields: ListBuffer[Field] = mutable.ListBuffer[Field]()
+
         for ((ele, record) <- tempSchemas) {
-          val optionalSchema = Schema createUnion List[Schema](nullSchema, record).asJava
-          val field = new Field(validName(ele.getName).get, optionalSchema, null, null)
+          val optionalSchema: Schema = Schema.createUnion(List[Schema](nullSchema, record).asJava)
+          val field: Field = new Field(validName(ele.getName).get, optionalSchema, null, null)
           field.addProp(XNode.SOURCE, XNode(ele).source)
           fields += field
         }
+
         val record = Schema.createRecord(generateTypeName, null, null, false)
         record.setFields(fields.asJava)
         record.addProp(XNode.SOURCE, XNode.DOCUMENT)
@@ -103,24 +122,34 @@ final class XsdToAvscConverter(config: Config) {
     schema
   }
 
-  private def processType(eleType: XSTypeDefinition, optional: Boolean, array: Boolean): Schema = {
+  /**
+   * complexType or simpleType
+   */
+  private def processType(typeDefinition: XSTypeDefinition, optional: Boolean, array: Boolean): Schema = {
     typeLevel += 1
-    var schema = eleType.getTypeCategory match {
-      case SIMPLE_TYPE => primaryType(eleType)
+
+    var schema = typeDefinition.getTypeCategory match {
+      case SIMPLE_TYPE =>
+        primaryType(typeDefinition)
       case COMPLEX_TYPE =>
-        val name = complexTypeName(eleType)
-        val tempSchema = schemas.getOrElse(name, createRecord(name, eleType))
+        val name: String = complexTypeName(typeDefinition)
+
+        //Create a new record-schema if it doesn't already exist
+        val tempSchema: Schema = schemas.getOrElse(name, createRecord(name, typeDefinition))
         tempSchema
       case others =>
         throw ConversionException(s"Unknown Element type: $others")
     }
+
     if (array) {
-      schema = Schema createArray schema
+      schema = Schema.createArray(schema)
     }
+
     if (optional) {
-      val nullSchema = Schema create Schema.Type.NULL
-      schema = Schema createUnion List[Schema](nullSchema, schema).asJava
+      val nullSchema: Schema = Schema.create(Schema.Type.NULL)
+      schema = Schema.createUnion(List[Schema](nullSchema, schema).asJava)
     }
+
     typeLevel -= 1
     schema
   }
@@ -355,8 +384,9 @@ final class XsdToAvscConverter(config: Config) {
           case _: IllegalArgumentException =>
         }
         // Handle hive keywords
-        if (!ignoreHiveKeywords && XsdToAvscConverter.HIVE_KEYWORDS.contains(finalName.toUpperCase))
+        if (!ignoreHiveKeywords && XsdToAvscConverter.HIVE_KEYWORDS.contains(finalName.toUpperCase)) {
           finalName = finalName + "_value"
+        }
         Option(finalName)
       }
     finalName
@@ -368,45 +398,57 @@ final class XsdToAvscConverter(config: Config) {
     schema
   }
 
+  /**
+   * Complex or simple type definition
+   */
   private def primaryType(schemaType: XSTypeDefinition): Schema = {
 
-    val simpleType = schemaType.asInstanceOf[XSSimpleTypeDefinition]
+    val simpleType: XSSimpleTypeDefinition = schemaType.asInstanceOf[XSSimpleTypeDefinition]
 
-    val schema = simpleType.getBuiltInKind match {
+    val schema: Schema = simpleType.getBuiltInKind match {
+
       // Mapping xs:dateTime to logical types
-      case XSConstants.DATETIME_DT => {
+      case XSConstants.DATETIME_DT =>
         xsDateTimeMapping match {
           case LogicalTypesConfig.TIMESTAMP_MILLIS | LogicalTypesConfig.TIMESTAMP_MICROS =>
             makeLogicalType(Schema.Type.LONG, xsDateTimeMapping)
-          case LogicalTypesConfig.LONG => Schema.create(Schema.Type.LONG)
-          case LogicalTypesConfig.STRING => Schema.create(Schema.Type.STRING)
-          case _ => throw ConversionException(s"Unsupported xs:dateTime logical type mapping: ${xsDateTimeMapping}");
+          case LogicalTypesConfig.LONG =>
+            Schema.create(Schema.Type.LONG)
+          case LogicalTypesConfig.STRING =>
+            Schema.create(Schema.Type.STRING)
+          case _ =>
+            throw ConversionException(s"Unsupported xs:dateTime logical type mapping: ${xsDateTimeMapping}");
         }
-      }
+
       // Mapping xs:time to logical types
-      case XSConstants.TIME_DT => {
+      case XSConstants.TIME_DT =>
         xsTimeMapping match {
           case LogicalTypesConfig.TIME_MILLIS | LogicalTypesConfig.TIME_MICROS =>
             makeLogicalType(Schema.Type.LONG, xsTimeMapping)
-          case LogicalTypesConfig.STRING => Schema.create(Schema.Type.STRING)
-          case _ => throw ConversionException(s"Unsupported xs:time logical type mapping: ${xsTimeMapping}");
+          case LogicalTypesConfig.STRING =>
+            Schema.create(Schema.Type.STRING)
+          case _ =>
+            throw ConversionException(s"Unsupported xs:time logical type mapping: ${xsTimeMapping}");
         }
-      }
+
       // Mapping xs:date to logical types
-      case XSConstants.DATE_DT => {
+      case XSConstants.DATE_DT =>
         xsDateMapping match {
           case LogicalTypesConfig.DATE =>
             makeLogicalType(Schema.Type.INT, xsDateMapping)
-          case LogicalTypesConfig.STRING => Schema.create(Schema.Type.STRING)
-          case _ => throw ConversionException(s"Unsupported xs:date logical type mapping: ${xsDateMapping}");
+          case LogicalTypesConfig.STRING =>
+            Schema.create(Schema.Type.STRING)
+          case _ =>
+            throw ConversionException(s"Unsupported xs:date logical type mapping: ${xsDateMapping}");
         }
-      }
+
       // Mapping xs:decimal type restricted with totalDigits and fractionDigits facets to logical decimal type
-      case XSConstants.DECIMAL_DT => {
+      case XSConstants.DECIMAL_DT =>
         mapDecimal(simpleType)
-      }
+
       // Mapping other types to non-logical types with a fallback to string
-      case otherType => Schema.create(XsdToAvscConverter.PRIMITIVES getOrElse(otherType, Schema.Type.STRING))
+      case otherType =>
+        Schema.create(XsdToAvscConverter.PRIMITIVES getOrElse(otherType, Schema.Type.STRING))
     }
 
     schema
@@ -417,7 +459,7 @@ final class XsdToAvscConverter(config: Config) {
 
     val factionDigitsFacet = Option(simpleType.getFacet(XSSimpleTypeDefinition.FACET_FRACTIONDIGITS).asInstanceOf[XSFacet])
 
-    val avroTypeMapping = if (xsDecimalMapping.avroType != DecimalConfig.DECIMAL || totalDigitsFacet.isDefined && factionDigitsFacet.isDefined) {
+    val avroTypeMapping: String = if (xsDecimalMapping.avroType != DecimalConfig.DECIMAL || totalDigitsFacet.isDefined && factionDigitsFacet.isDefined) {
       xsDecimalMapping.avroType
     } else {
       xsDecimalMapping.fallbackType
@@ -433,7 +475,7 @@ final class XsdToAvscConverter(config: Config) {
       // xs:decimal to Avro decimal
       case DecimalConfig.DECIMAL =>
 
-        val precision = if (totalDigitsFacet.isDefined) {
+        val precision: Int = if (totalDigitsFacet.isDefined) {
           totalDigitsFacet.get.getIntFacetValue
         } else {
           xsDecimalMapping.fallbackPrecision.toInt
