@@ -3,7 +3,7 @@ apply plugin: 'maven'
 apply plugin: 'scala'
 
 group = 'no.ssb'
-version = '0.0.1-SNAPSHOT'
+version = '0.1.0-SNAPSHOT'
 
 description = "Convert XML Schema definitions (xsd) into avro schemas (avsc)"
 
@@ -17,6 +17,7 @@ repositories {
 dependencies {
     implementation 'org.scala-lang:scala-library:2.12.1'
     implementation 'org.scala-lang:scala-reflect:2.12.1'
+    implementation 'org.scala-lang.modules:scala-xml_2.12:1.2.0'
     implementation 'xerces:xercesImpl:2.11.0'
     implementation 'commons-io:commons-io:2.6'
 

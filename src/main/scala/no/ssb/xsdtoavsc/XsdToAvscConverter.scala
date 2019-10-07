@@ -9,8 +9,8 @@ import org.apache.avro.Schema
 import org.apache.avro.Schema.Field
 import org.apache.xerces.dom.DOMInputImpl
 import org.apache.xerces.impl.Constants
+import org.apache.xerces.impl.dv.xs.XSSimpleTypeDecl
 import org.apache.xerces.impl.xs.{SchemaGrammar, XMLSchemaLoader, XSComplexTypeDecl}
-import org.apache.xerces.xs.XSConstants.{ATTRIBUTE_DECLARATION, ELEMENT_DECLARATION, MODEL_GROUP, WILDCARD}
 import org.apache.xerces.xs.XSTypeDefinition.{COMPLEX_TYPE, SIMPLE_TYPE}
 import org.apache.xerces.xs._
 import org.codehaus.jackson.JsonNode
@@ -20,6 +20,7 @@ import scala.collection.JavaConverters._
 import scala.collection.immutable.HashMap
 import scala.collection.mutable
 import scala.collection.mutable.ListBuffer
+import scala.xml.XML
 
 final class XsdToAvscConverter(config: Config) {
 
@@ -60,12 +61,12 @@ final class XsdToAvscConverter(config: Config) {
   }
 
   def getRootElements(root: QName, elements: XSNamedMap): HashMap[String, XSObject] = {
-      val rootElement: Option[XSObject] = Option(elements.itemByName(getNamespace(root), root.getLocalPart))
+    val rootElement: Option[XSObject] = Option(elements.itemByName(getNamespace(root), root.getLocalPart))
 
-      if (rootElement.isEmpty) {
-        throw new NoSuchElementException(s"The schema contains no root level element definition for QName '${rootElementQName.get}'")
-      }
-      HashMap("1" -> rootElement.get)
+    if (rootElement.isEmpty) {
+      throw new NoSuchElementException(s"The schema contains no root level element definition for QName '${rootElementQName.get}'")
+    }
+    HashMap("1" -> rootElement.get)
   }
 
   def convert(xsd: InputStream): Schema = {
@@ -92,7 +93,7 @@ final class XsdToAvscConverter(config: Config) {
       val tempSchemas: mutable.LinkedHashMap[XSObject, Schema] = mutable.LinkedHashMap[XSObject, Schema]()
 
       for ((_, elementDeclaration: XSElementDeclaration) <- rootElements) {
-        tempSchemas += elementDeclaration -> processType(elementDeclaration.getTypeDefinition, optional = false, array = false)
+        tempSchemas += elementDeclaration -> xsTypeDefinitionToAvscSchema(elementDeclaration.getTypeDefinition, optional = false, array = false)
       }
 
       if (tempSchemas.isEmpty) {
@@ -125,7 +126,7 @@ final class XsdToAvscConverter(config: Config) {
   /**
    * complexType or simpleType
    */
-  private def processType(typeDefinition: XSTypeDefinition, optional: Boolean, array: Boolean): Schema = {
+  private def xsTypeDefinitionToAvscSchema(typeDefinition: XSTypeDefinition, optional: Boolean, array: Boolean): Schema = {
     typeLevel += 1
 
     var schema = typeDefinition.getTypeCategory match {
@@ -197,11 +198,15 @@ final class XsdToAvscConverter(config: Config) {
       val optional = innerOptional || particle.getMinOccurs == 0
       val array = innerArray || particle.getMaxOccurs > 1 || particle.getMaxOccursUnbounded
       val innerTerm = particle.getTerm
-      innerTerm.getType match {
-        case ELEMENT_DECLARATION | WILDCARD =>
-          val field = createField(innerTerm, optional, array)
+
+      innerTerm match {
+        case elementDeclaration: XSElementDeclaration =>
+          val field = xsElementToAvscField(elementDeclaration, optional, array)
           fields += (field.name() -> field)
-        case MODEL_GROUP =>
+        case wildcard: XSWildcard =>
+          val field = xsWildcardToAvscField(wildcard)
+          fields += (field.name() -> field)
+        case _: XSModelGroup =>
           fields ++= processGroup(innerTerm, optional, array)
         case _ =>
           throw ConversionException(s"Unsupported term type ${group.getType}")
@@ -217,14 +222,14 @@ final class XsdToAvscConverter(config: Config) {
     val attributes = complexType.getAttributeUses
     for (attribute <- attributes.asScala.map(_.asInstanceOf[XSAttributeUse])) {
       val optional = !attribute.getRequired
-      val field = createField(attribute.getAttrDeclaration, optional)
+      val field = xsAttributeToAvscField(attribute.getAttrDeclaration, optional)
       fields += (field.name() -> field)
     }
 
     // Process wildcard attribute
     val wildcard = Option(complexType.getAttributeWildcard)
     if (wildcard.isDefined) {
-      val field = createField(wildcard.get, optional = true)
+      val field = xsWildcardToAvscField(wildcard.get)
       fields += (field.name() -> field)
     }
     fields
@@ -237,7 +242,7 @@ final class XsdToAvscConverter(config: Config) {
       var extnType = complexType
       while (extnType.getBaseType.getTypeCategory == XSTypeDefinition.COMPLEX_TYPE) extnType =
         extnType.getBaseType.asInstanceOf[XSComplexTypeDefinition]
-      val fieldSchema = processType(extnType.getBaseType, optional = true, array = false)
+      val fieldSchema = xsTypeDefinitionToAvscSchema(extnType.getBaseType, optional = true, array = false)
       val field = new Field(XNode.TEXT_VALUE, fieldSchema, null, null)
       field.addProp(XNode.SOURCE, XNode.textNode.source)
       fields += (field.name() -> field)
@@ -290,46 +295,110 @@ final class XsdToAvscConverter(config: Config) {
     }
   }
 
-  // Create field for an element
-  private def createField(ele: XSObject, optional: Boolean, array: Boolean = false): Schema.Field = {
-    val field: Field = ele.getType match {
-      case ELEMENT_DECLARATION | ATTRIBUTE_DECLARATION =>
-        val (eleType, attribute) = ele.getType match {
-          case ELEMENT_DECLARATION =>
-            (ele.asInstanceOf[XSElementDeclaration].getTypeDefinition, false)
-          case ATTRIBUTE_DECLARATION =>
-            (ele.asInstanceOf[XSAttributeDeclaration].getTypeDefinition, true)
-        }
+  /**
+   * <element> -> AVSC-field
+   */
+  def xsElementToAvscField(elementDeclaration: XSElementDeclaration, optional: Boolean, array: Boolean = false): Schema.Field = {
 
-        val fieldName = {
-          if (attribute) {
-            validName(config.attributePrefix + ele.getName).get
-          } else {
-            validName(ele.getName).get
-          }
-        }
+    val fieldName = validName(elementDeclaration.getName).get
 
-        val fieldSchema: Schema = processType(eleType, optional, array)
-        val defaultValue: JsonNode = if (optional) NullNode.getInstance() else null
+    val doc = getDocumentation(elementDeclaration).orNull
 
-        val field: Field = new Field(fieldName, fieldSchema, null, defaultValue)
+    val typeDefinition = elementDeclaration.getTypeDefinition
+    val fieldSchema: Schema = xsTypeDefinitionToAvscSchema(typeDefinition, optional, array)
+    val defaultValue: JsonNode = if (optional) NullNode.getInstance() else null
 
-        field.addProp(XNode.SOURCE, XNode(ele, attribute).source)
+    val field: Field = new Field(fieldName, fieldSchema, doc, defaultValue)
 
-        if (eleType.getTypeCategory == SIMPLE_TYPE) {
-          val tempType = eleType.asInstanceOf[XSSimpleTypeDefinition].getBuiltInKind
-          if (tempType == XSConstants.DATETIME_DT && xsDateTimeMapping == LogicalTypesConfig.LONG) {
-            field.addProp("comment", "timestamp")
-          }
-        }
-        field
-      case WILDCARD =>
-        val map = Schema.createMap(Schema.create(Schema.Type.STRING))
-        new Field(XNode.WILDCARD, map, null, null)
-      case _ =>
-        throw ConversionException("Invalid source object type " + ele.getType)
+    field.addProp(XNode.SOURCE, XNode(elementDeclaration).source)
+
+    if (typeDefinition.getTypeCategory == SIMPLE_TYPE) {
+      val tempType = typeDefinition.asInstanceOf[XSSimpleTypeDefinition].getBuiltInKind
+      if (tempType == XSConstants.DATETIME_DT && xsDateTimeMapping == LogicalTypesConfig.LONG) {
+        field.addProp("comment", "timestamp")
+      }
     }
+
     field
+  }
+
+  /**
+   * <attribute> -> AVSC-field
+   */
+  def xsAttributeToAvscField(attributeDeclaration: XSAttributeDeclaration, optional: Boolean, array: Boolean = false): Schema.Field = {
+    val fieldName = validName(config.attributePrefix + attributeDeclaration.getName).get
+
+    val typeDefinition: XSSimpleTypeDefinition = attributeDeclaration.getTypeDefinition
+    val fieldSchema: Schema = xsTypeDefinitionToAvscSchema(typeDefinition, optional, array)
+    val defaultValue: JsonNode = if (optional) NullNode.getInstance() else null
+
+    val field: Field = new Field(fieldName, fieldSchema, null, defaultValue)
+
+    field.addProp(XNode.SOURCE, XNode(attributeDeclaration, attribute = true).source)
+
+    val tempType = typeDefinition.getBuiltInKind
+    if (tempType == XSConstants.DATETIME_DT && xsDateTimeMapping == LogicalTypesConfig.LONG) {
+      field.addProp("comment", "timestamp")
+    }
+
+    field
+  }
+
+  /**
+   * <any> or <anyAttribute> -> AVSC-field
+   */
+  def xsWildcardToAvscField(wildcard: XSWildcard): Schema.Field = {
+    val map = Schema.createMap(Schema.create(Schema.Type.STRING))
+    new Field(XNode.WILDCARD, map, null, null)
+  }
+
+  /**
+   * Get the documentation of an <element>, if it exists. E.g:
+   *
+   * <element>
+   * <annotation>
+   * <documentation>This is the doc</documentation>
+   * </annotation>
+   * </element>
+   *
+   * Alternately, if the element had no doc, look at the type. E.g:
+   *
+   * <complexType>
+   * <annotation>
+   * <documentation>This is the alternate doc</documentation>
+   * </annotation>
+   * </complexType>
+   */
+  def getDocumentation(elementDeclaration: XSElementDeclaration): Option[String] = {
+    val elementDocumentation = getDocumentation(elementDeclaration.getAnnotations)
+
+    if (elementDocumentation.isDefined) {
+      return elementDocumentation
+    }
+
+    elementDeclaration.getTypeDefinition match {
+      case complexTypeDecl: XSComplexTypeDecl =>
+        getDocumentation(complexTypeDecl.getAnnotations)
+      case simpleTypeDecl: XSSimpleTypeDecl =>
+        getDocumentation(simpleTypeDecl.getAnnotations)
+      case _ =>
+        None
+    }
+  }
+
+  def getDocumentation(objectList: XSObjectList): Option[String] = {
+
+    for (i <- 0 until objectList.getLength) {
+      objectList.item(i) match {
+        case annotation: XSAnnotation =>
+          val elem = XML.loadString(annotation.getAnnotationString)
+          val maybeDoc = Option((elem \ "documentation").text)
+          if (maybeDoc.isDefined && !"".equals(maybeDoc.get)) {
+            return maybeDoc
+          }
+      }
+    }
+    None
   }
 
   // Create record for an element
